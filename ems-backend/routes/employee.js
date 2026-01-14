@@ -64,12 +64,15 @@ router.get('/employees/:id', auth, async (req, res) => {
   const { id } = req.params;
   const { region_id } = req.user;
 
+  // Use the view that already has salary data
   const result = await pool.query(
     `
-    SELECT v.*
+    SELECT 
+      v.*,
+      s.current_ctc
     FROM vw_employee_details v
-    JOIN location l
-      ON l.city = v.location
+    JOIN location l ON l.city = v.location
+    LEFT JOIN vw_employee_with_current_salary s ON v.employee_id = s.employee_id
     WHERE v.employee_id = $1
       AND l.region_id = $2
     `,
@@ -80,7 +83,30 @@ router.get('/employees/:id', auth, async (req, res) => {
     return res.status(404).json({ message: 'Employee not found' });
   }
 
-  res.json(result.rows[0]);
+  const employeeData = result.rows[0];
+
+  // Fetch full salary details from employee_salary_current
+  const salaryResult = await pool.query(
+    `
+    SELECT 
+      ctc_lpa,
+      salary_type,
+      effective_from,
+      remarks,
+      updated_at,
+      currency
+    FROM employee_salary_current
+    WHERE employee_id = $1
+    `,
+    [id]
+  );
+
+  // Add salary data if exists
+  if (salaryResult.rows.length > 0) {
+    employeeData.salary = salaryResult.rows[0];
+  }
+
+  res.json(employeeData);
 });
 
 
