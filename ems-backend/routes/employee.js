@@ -51,6 +51,96 @@ router.get('/employees', auth, async (req, res) => {
 });
 
 
+/**
+ * =====================================================
+ * GET LOOKUP DATA (for dropdowns in Add Employee form)
+ * URL: GET /api/employees/lookups
+ * NOTE: This MUST be BEFORE /api/employees/:id route
+ * Returns all master data with relationships for cascading dropdowns
+ * =====================================================
+ */
+router.get('/employees/lookups', auth, async (req, res) => {
+  try {
+    const { region_id, country_id } = req.user;
+
+    // Get all countries
+    const countries = await pool.query(
+      'SELECT country_id, country_name FROM country ORDER BY country_name'
+    );
+    
+    // Get all regions with country info
+    const regions = await pool.query(
+      `SELECT r.region_id, r.region_name, r.country_id, c.country_name
+       FROM region r
+       JOIN country c ON r.country_id = c.country_id
+       ORDER BY c.country_name, r.region_name`
+    );
+    
+    // Get all companies with country info
+    const companies = await pool.query(
+      `SELECT c.company_id, c.company_name, c.country_id, co.country_name
+       FROM company c
+       JOIN country co ON c.country_id = co.country_id
+       ORDER BY c.company_name`
+    );
+    
+    // Get all locations with full hierarchy (company, country, region)
+    const locations = await pool.query(
+      `SELECT 
+         l.location_id, 
+         l.city, 
+         l.state, 
+         l.company_id, 
+         l.country_id, 
+         l.region_id,
+         c.company_name,
+         co.country_name,
+         r.region_name
+       FROM location l
+       JOIN company c ON l.company_id = c.company_id
+       LEFT JOIN country co ON l.country_id = co.country_id
+       LEFT JOIN region r ON l.region_id = r.region_id
+       ORDER BY co.country_name, l.city`
+    );
+    
+    // Get all departments
+    const departments = await pool.query(
+      'SELECT department_id, department_name FROM department ORDER BY department_name'
+    );
+    
+    // Get all designations with department info
+    const designations = await pool.query(
+      `SELECT 
+         d.designation_id, 
+         d.designation_name, 
+         d.department_id, 
+         dep.department_name,
+         d.min_ctc_lpa,
+         d.max_ctc_lpa
+       FROM designation d
+       JOIN department dep ON d.department_id = dep.department_id
+       ORDER BY dep.department_name, d.designation_name`
+    );
+
+    res.json({
+      countries: countries.rows,
+      regions: regions.rows,
+      companies: companies.rows,
+      locations: locations.rows,
+      departments: departments.rows,
+      designations: designations.rows,
+      // Send user's context for default selections
+      userContext: {
+        country_id,
+        region_id
+      }
+    });
+
+  } catch (err) {
+    console.error('GET lookups error:', err);
+    res.status(500).json({ message: 'Failed to fetch lookup data' });
+  }
+});
 
 
 /**
@@ -170,6 +260,208 @@ router.get('/employees/search', auth, async (req, res) => {
 
 /**
  * =====================================================
+ * ADD NEW EMPLOYEE
+ * URL: POST /api/employees
+ * =====================================================
+ */
+router.post('/employees', auth, async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
+
+    const {
+      first_name,
+      last_name,
+      email,
+      phone,
+      company_id,
+      location_id,
+      department_id,
+      designation_id,
+      joining_date,
+      employment_type,
+      gender,
+      dob,
+      // Salary information
+      ctc_lpa,
+      salary_type = 'FIXED',
+      effective_from,
+      currency = 'INR',
+      salary_remarks
+    } = req.body;
+
+    // Validate required fields
+    if (!first_name || !last_name || !email || !company_id || !location_id || 
+        !department_id || !designation_id || !employment_type) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ 
+        message: 'Missing required fields' 
+      });
+    }
+
+    // Insert employee
+    const employeeResult = await client.query(
+      `
+      INSERT INTO employee (
+        first_name, last_name, email, phone, company_id, location_id,
+        department_id, designation_id, joining_date, employment_type,
+        gender, dob
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      RETURNING employee_id
+      `,
+      [
+        first_name, last_name, email, phone, company_id, location_id,
+        department_id, designation_id, joining_date, employment_type,
+        gender, dob
+      ]
+    );
+
+    const newEmployeeId = employeeResult.rows[0].employee_id;
+
+    // Insert salary information if provided
+    if (ctc_lpa && parseFloat(ctc_lpa) > 0) {
+      const salaryEffectiveDate = effective_from || joining_date || new Date().toISOString().split('T')[0];
+      
+      // Insert into employee_salary_current
+      await client.query(
+        `
+        INSERT INTO employee_salary_current (
+          employee_id, ctc_lpa, salary_type, effective_from, currency, remarks
+        ) VALUES ($1, $2, $3, $4, $5, $6)
+        `,
+        [newEmployeeId, parseFloat(ctc_lpa), salary_type, salaryEffectiveDate, currency, salary_remarks]
+      );
+
+      // Also add to history
+      await client.query(
+        `
+        INSERT INTO employee_salary_history (
+          employee_id, ctc_lpa, effective_from, salary_type, currency, remarks
+        ) VALUES ($1, $2, $3, $4, $5, $6)
+        `,
+        [newEmployeeId, parseFloat(ctc_lpa), salaryEffectiveDate, salary_type, currency, salary_remarks]
+      );
+    }
+
+    await client.query('COMMIT');
+
+    res.status(201).json({
+      message: 'Employee added successfully',
+      employee_id: newEmployeeId
+    });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('ADD employee error:', err);
+    
+    if (err.constraint === 'employee_email_key') {
+      return res.status(400).json({ message: 'Email already exists' });
+    }
+    
+    if (err.code === '23514') { // Check constraint violation
+      return res.status(400).json({ 
+        message: 'Invalid data: ' + (err.detail || err.message)
+      });
+    }
+    
+    res.status(500).json({ 
+      message: 'Failed to add employee',
+      error: err.message 
+    });
+  } finally {
+    client.release();
+  }
+});
+
+
+/**
+ * =====================================================
+ * DELETE EMPLOYEE
+ * URL: DELETE /api/employees/:id
+ * Deletes employee and all related records from all tables
+ * =====================================================
+ */
+router.delete('/employees/:id', auth, async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    const { id } = req.params;
+    const { region_id } = req.user;
+
+    // Check if employee exists and belongs to HR's region
+    const checkResult = await client.query(
+      `
+      SELECT e.employee_id
+      FROM employee e
+      JOIN location l ON e.location_id = l.location_id
+      WHERE e.employee_id = $1 AND l.region_id = $2
+      `,
+      [id, region_id]
+    );
+
+    if (checkResult.rows.length === 0) {
+      return res.status(404).json({ 
+        message: 'Employee not found or access denied' 
+      });
+    }
+
+    await client.query('BEGIN');
+
+    // Explicitly delete from all related tables to ensure data integrity
+    // Even though some have CASCADE, explicit deletion ensures clean removal
+    
+    // 1. Delete attendance records
+    await client.query('DELETE FROM attendance WHERE employee_id = $1', [id]);
+    
+    // 2. Delete leave requests
+    await client.query('DELETE FROM leave_request WHERE employee_id = $1', [id]);
+    
+    // 3. Delete employee projects
+    await client.query('DELETE FROM employee_project WHERE employee_id = $1', [id]);
+    
+    // 4. Delete performance reviews
+    await client.query('DELETE FROM employee_performance WHERE employee_id = $1', [id]);
+    
+    // 5. Delete documents
+    await client.query('DELETE FROM employee_document WHERE employee_id = $1', [id]);
+    
+    // 6. Delete salary history
+    await client.query('DELETE FROM employee_salary_history WHERE employee_id = $1', [id]);
+    
+    // 7. Delete current salary
+    await client.query('DELETE FROM employee_salary_current WHERE employee_id = $1', [id]);
+    
+    // 8. Finally, delete the employee record
+    const deleteResult = await client.query(
+      'DELETE FROM employee WHERE employee_id = $1 RETURNING employee_id',
+      [id]
+    );
+
+    await client.query('COMMIT');
+
+    console.log(`✅ Employee ${id} and all related records deleted successfully`);
+
+    res.json({ 
+      message: 'Employee and all related records deleted successfully',
+      employee_id: parseInt(id)
+    });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('DELETE employee error:', err);
+    res.status(500).json({ 
+      message: 'Failed to delete employee',
+      error: err.message 
+    });
+  } finally {
+    client.release();
+  }
+});
+
+
+/**
+ * =====================================================
  * UPDATE EMPLOYEE (basic edit – optional)
  * URL: PUT /api/employees/:id
  * =====================================================
@@ -179,7 +471,6 @@ router.put('/employees/:id', auth, async (req, res) => {
     const { id } = req.params;
     const {
       phone,
-      status,
       employment_type,
       department_id,
       designation_id
@@ -190,15 +481,13 @@ router.put('/employees/:id', auth, async (req, res) => {
       UPDATE employee
       SET
         phone = $1,
-        status = $2,
-        employment_type = $3,
-        department_id = $4,
-        designation_id = $5
-      WHERE employee_id = $6
+        employment_type = $2,
+        department_id = $3,
+        designation_id = $4
+      WHERE employee_id = $5
       `,
       [
         phone,
-        status,
         employment_type,
         department_id,
         designation_id,
