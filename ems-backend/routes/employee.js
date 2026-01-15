@@ -146,7 +146,7 @@ router.get('/employees/lookups', auth, async (req, res) => {
 /**
  * =====================================================
  * GET SINGLE EMPLOYEE (Full details)
- * Used by: Employee Details page
+ * Used by: Employee Details page and Update Employee form
  * URL: GET /api/employees/:id
  * =====================================================
  */
@@ -154,16 +154,38 @@ router.get('/employees/:id', auth, async (req, res) => {
   const { id } = req.params;
   const { region_id } = req.user;
 
-  // Use the view that already has salary data
+  // Get complete employee data including IDs needed for editing
   const result = await pool.query(
     `
     SELECT 
-      v.*,
-      s.current_ctc
-    FROM vw_employee_details v
-    JOIN location l ON l.city = v.location
-    LEFT JOIN vw_employee_with_current_salary s ON v.employee_id = s.employee_id
-    WHERE v.employee_id = $1
+      e.employee_id,
+      e.first_name,
+      e.last_name,
+      e.email,
+      e.phone,
+      e.company_id,
+      e.location_id,
+      e.department_id,
+      e.designation_id,
+      e.joining_date,
+      e.employment_type,
+      e.gender,
+      e.dob,
+      c.company_name,
+      l.city AS location,
+      l.state,
+      l.country_id,
+      l.region_id,
+      co.country_name,
+      d.department_name,
+      des.designation_name
+    FROM employee e
+    JOIN company c ON e.company_id = c.company_id
+    JOIN location l ON e.location_id = l.location_id
+    JOIN country co ON l.country_id = co.country_id
+    JOIN department d ON e.department_id = d.department_id
+    JOIN designation des ON e.designation_id = des.designation_id
+    WHERE e.employee_id = $1
       AND l.region_id = $2
     `,
     [id, region_id]
@@ -462,43 +484,215 @@ router.delete('/employees/:id', auth, async (req, res) => {
 
 /**
  * =====================================================
- * UPDATE EMPLOYEE (basic edit – optional)
+ * UPDATE EMPLOYEE (full edit)
  * URL: PUT /api/employees/:id
  * =====================================================
  */
 router.put('/employees/:id', auth, async (req, res) => {
+  const client = await pool.connect();
+  
   try {
+    await client.query('BEGIN');
+
     const { id } = req.params;
     const {
+      first_name,
+      last_name,
+      email,
       phone,
-      employment_type,
+      company_id,
+      location_id,
       department_id,
-      designation_id
+      designation_id,
+      joining_date,
+      employment_type,
+      gender,
+      dob,
+      // Salary information
+      ctc_lpa,
+      salary_type,
+      effective_from,
+      currency,
+      salary_remarks
     } = req.body;
 
-    await pool.query(
-      `
-      UPDATE employee
-      SET
-        phone = $1,
-        employment_type = $2,
-        department_id = $3,
-        designation_id = $4
-      WHERE employee_id = $5
-      `,
+    // Validate required fields
+    if (!first_name || !last_name || !email || !company_id || !location_id || 
+        !department_id || !designation_id || !employment_type) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ 
+        message: 'Missing required fields' 
+      });
+    }
+
+    // Check if employee exists
+    const empCheck = await client.query(
+      'SELECT employee_id FROM employee WHERE employee_id = $1',
+      [id]
+    );
+
+    if (empCheck.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ 
+        message: 'Employee not found' 
+      });
+    }
+
+    // Update employee basic information
+    await client.query(
+      `UPDATE employee
+       SET
+         first_name = $1,
+         last_name = $2,
+         email = $3,
+         phone = $4,
+         company_id = $5,
+         location_id = $6,
+         department_id = $7,
+         designation_id = $8,
+         joining_date = $9,
+         employment_type = $10,
+         gender = $11,
+         dob = $12
+       WHERE employee_id = $13`,
       [
+        first_name,
+        last_name,
+        email,
         phone,
-        employment_type,
+        company_id,
+        location_id,
         department_id,
         designation_id,
+        joining_date,
+        employment_type,
+        gender,
+        dob,
         id
       ]
     );
 
-    res.json({ message: 'Employee updated successfully' });
+    // Update salary information if provided
+    if (ctc_lpa && effective_from) {
+      // Check if current salary record exists
+      const currentSalaryCheck = await client.query(
+        'SELECT employee_id FROM employee_salary_current WHERE employee_id = $1',
+        [id]
+      );
+
+      if (currentSalaryCheck.rows.length > 0) {
+        // Get the current salary data before updating
+        const oldSalary = await client.query(
+          'SELECT ctc_lpa, effective_from, salary_type, currency FROM employee_salary_current WHERE employee_id = $1',
+          [id]
+        );
+
+        // Check if salary has actually changed
+        const oldData = oldSalary.rows[0];
+        const salaryChanged = 
+          parseFloat(oldData.ctc_lpa) !== parseFloat(ctc_lpa) ||
+          oldData.effective_from !== effective_from ||
+          oldData.salary_type !== salary_type;
+
+        if (salaryChanged) {
+          // Archive the old salary to history
+          await client.query(
+            `INSERT INTO employee_salary_history 
+             (employee_id, ctc_lpa, effective_from, effective_to, salary_type, currency, remarks)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [
+              id,
+              oldData.ctc_lpa,
+              oldData.effective_from,
+              new Date().toISOString().split('T')[0], // Set effective_to to today
+              oldData.salary_type,
+              oldData.currency || 'INR',
+              'Archived due to salary update'
+            ]
+          );
+
+          // Update current salary
+          await client.query(
+            `UPDATE employee_salary_current
+             SET
+               ctc_lpa = $1,
+               salary_type = $2,
+               effective_from = $3,
+               currency = $4,
+               remarks = $5,
+               updated_at = CURRENT_TIMESTAMP
+             WHERE employee_id = $6`,
+            [
+              ctc_lpa,
+              salary_type || 'FIXED',
+              effective_from,
+              currency || 'INR',
+              salary_remarks,
+              id
+            ]
+          );
+        } else {
+          // Just update remarks and other non-critical fields if no salary change
+          await client.query(
+            `UPDATE employee_salary_current
+             SET
+               remarks = $1,
+               updated_at = CURRENT_TIMESTAMP
+             WHERE employee_id = $2`,
+            [salary_remarks, id]
+          );
+        }
+      } else {
+        // Insert new salary record if none exists
+        await client.query(
+          `INSERT INTO employee_salary_current 
+           (employee_id, ctc_lpa, salary_type, effective_from, currency, remarks)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [
+            id,
+            ctc_lpa,
+            salary_type || 'FIXED',
+            effective_from,
+            currency || 'INR',
+            salary_remarks
+          ]
+        );
+
+        // Also add to history
+        await client.query(
+          `INSERT INTO employee_salary_history 
+           (employee_id, ctc_lpa, effective_from, effective_to, salary_type, currency, remarks)
+           VALUES ($1, $2, $3, NULL, $4, $5, $6)`,
+          [
+            id,
+            ctc_lpa,
+            effective_from,
+            salary_type || 'FIXED',
+            currency || 'INR',
+            salary_remarks
+          ]
+        );
+      }
+    }
+
+    await client.query('COMMIT');
+
+    console.log(`✅ Employee ${id} updated successfully`);
+
+    res.json({ 
+      message: 'Employee updated successfully',
+      employee_id: parseInt(id)
+    });
+
   } catch (err) {
+    await client.query('ROLLBACK');
     console.error('UPDATE employee error:', err);
-    res.status(500).json({ message: 'Server error' });
+    res.status(500).json({ 
+      message: 'Failed to update employee',
+      error: err.message 
+    });
+  } finally {
+    client.release();
   }
 });
 
